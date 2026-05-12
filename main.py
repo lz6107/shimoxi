@@ -13,7 +13,7 @@ from openai import OpenAI
 
 
 # =========================
-# 基础配置（石墨烯财经 5图版）
+# 基础配置（石墨烯财经 新闻精选正式版）
 # =========================
 
 RSS_URLS = [
@@ -26,16 +26,26 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
-SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
-MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "500"))
-MAX_FEED_ITEMS_PER_CHECK = int(os.getenv("MAX_FEED_ITEMS_PER_CHECK", "4"))
+# 正式频道：少发、精发、省 token
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))          # 每 30 分钟检查一次
+SEND_DELAY = float(os.getenv("SEND_DELAY", "3"))
+MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "260"))   # 摘要缩短，省 token
+MAX_FEED_ITEMS_PER_CHECK = int(os.getenv("MAX_FEED_ITEMS_PER_CHECK", "3"))
+
+# 目标：每天 4-8 条新闻
+MIN_NEWS_PER_DAY = int(os.getenv("MIN_NEWS_PER_DAY", "4"))
+MAX_NEWS_PER_DAY = int(os.getenv("MAX_NEWS_PER_DAY", "8"))
+MAX_NEWS_PER_CHECK = int(os.getenv("MAX_NEWS_PER_CHECK", "1"))
+
+# 重要性门槛：白天严格，晚上没够 4 条时稍微放宽
+MIN_IMPORTANCE_SCORE = int(os.getenv("MIN_IMPORTANCE_SCORE", "7"))
+MIN_RELAXED_IMPORTANCE_SCORE = int(os.getenv("MIN_RELAXED_IMPORTANCE_SCORE", "5"))
 
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4-nano")
 FIRST_RUN_SKIP_OLD = True
 IMAGES_DIR = "images"
 
-# 5张图文件名
+# 5 张图文件名
 BTC_IMAGE = os.getenv("BTC_IMAGE", "btc.png")
 ETH_IMAGE = os.getenv("ETH_IMAGE", "eth.png")
 ALTCOIN_IMAGE = os.getenv("ALTCOIN_IMAGE", "altcoin.png")
@@ -58,7 +68,112 @@ SKIP_KEYWORDS = [
     "live updates",
     "opinion",
     "editorial",
+    "interview",
+    "sponsored",
+    "press release",
+    "partner",
+    "partnership",
+    "price prediction",
 ]
+
+
+# =========================
+# 重要性打分
+# =========================
+
+IMPORTANT_KEYWORDS = [
+    # 主线资产
+    ("bitcoin", 3), ("btc", 3),
+    ("ethereum", 3), ("eth", 3),
+
+    # ETF / 监管 / 宏观
+    ("etf", 3), ("sec", 3), ("cftc", 3),
+    ("fed", 3), ("federal reserve", 3),
+    ("rate cut", 3), ("interest rate", 2),
+    ("inflation", 2), ("cpi", 2),
+    ("regulation", 2), ("lawsuit", 2), ("court", 2),
+
+    # 交易所 / 机构
+    ("binance", 2), ("coinbase", 2), ("okx", 2),
+    ("blackrock", 2), ("fidelity", 2),
+    ("microstrategy", 2), ("strategy", 1),
+
+    # 链上 / 风险事件
+    ("whale", 2), ("on-chain", 2), ("onchain", 2),
+    ("inflow", 2), ("outflow", 2),
+    ("liquidation", 3), ("liquidations", 3),
+    ("hack", 4), ("hacked", 4), ("exploit", 4),
+    ("stablecoin", 2), ("tether", 2), ("usdt", 2),
+    ("circle", 2), ("usdc", 2),
+
+    # 热门山寨
+    ("solana", 2), ("sol", 2),
+    ("xrp", 2), ("bnb", 2),
+    ("dogecoin", 1), ("doge", 1),
+    ("pepe", 1), ("meme", 1),
+    ("ai token", 1), ("airdrop", 1),
+]
+
+LOW_VALUE_KEYWORDS = [
+    "podcast",
+    "newsletter",
+    "video",
+    "watch live",
+    "live blog",
+    "live updates",
+    "opinion",
+    "editorial",
+    "interview",
+    "sponsored",
+    "press release",
+    "partner",
+    "partnership",
+    "conference",
+    "event recap",
+]
+
+
+def importance_score(title_en: str, summary_en: str = "") -> int:
+    title_lower = (title_en or "").lower()
+    text = f"{title_en} {summary_en}".lower()
+
+    score = 0
+
+    for kw, points in IMPORTANT_KEYWORDS:
+        if kw in text:
+            score += points
+
+    for kw in LOW_VALUE_KEYWORDS:
+        if kw in text:
+            score -= 4
+
+    # 核心词出现在标题里，额外加分
+    hot_title_words = [
+        "bitcoin", "btc", "ethereum", "eth",
+        "etf", "sec", "fed",
+        "binance", "coinbase",
+        "hack", "exploit",
+        "liquidation", "whale",
+    ]
+
+    for kw in hot_title_words:
+        if kw in title_lower:
+            score += 1
+
+    # 明显大事件词，额外加分
+    big_event_words = [
+        "surges", "plunges", "falls", "jumps",
+        "record", "approval", "approved",
+        "rejects", "sues", "settlement",
+        "breach", "stolen", "ban",
+        "launches", "files", "warns",
+    ]
+
+    for kw in big_event_words:
+        if kw in title_lower:
+            score += 1
+
+    return score
 
 
 # =========================
@@ -79,6 +194,19 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sent_fingerprints (
             fingerprint TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+
+    # 新增日志表：只用于统计和观察，不影响旧去重表
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS news_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            link TEXT,
+            title TEXT,
+            status TEXT,
+            score INTEGER,
+            reason TEXT,
             created_at TEXT
         )
     """)
@@ -138,6 +266,105 @@ def mark_sent(link: str, fingerprint: str):
 
     conn.commit()
     conn.close()
+
+
+def log_news(link: str, title: str, status: str, score: int = 0, reason: str = ""):
+    """
+    记录处理日志。
+    为了避免 held 类新闻每 30 分钟刷一堆日志，同一个 link + status + reason 只记录一次。
+    """
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT 1 FROM news_log
+        WHERE link = ?
+          AND status = ?
+          AND reason = ?
+        LIMIT 1
+        """,
+        (link, status, reason)
+    )
+
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute(
+            """
+            INSERT INTO news_log(link, title, status, score, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (link, title, status, score, reason, now)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def sent_news_count_today() -> int:
+    """
+    统计今天已发送数量。
+
+    兼容旧版本：
+    - 新版本发送成功会写 news_log(status='sent')
+    - 旧版本没有 news_log，只写 sent_links
+    - 所以这里会把“今天 sent_links 里但 news_log 没记录的旧发送”也算上
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM news_log
+        WHERE status = 'sent'
+          AND created_at LIKE ?
+        """,
+        (today + "%",)
+    )
+    sent_from_log = cur.fetchone()[0]
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM sent_links sl
+        WHERE sl.created_at LIKE ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM news_log nl
+              WHERE nl.link = sl.link
+          )
+        """,
+        (today + "%",)
+    )
+    legacy_sent = cur.fetchone()[0]
+
+    conn.close()
+    return sent_from_log + legacy_sent
+
+
+def current_min_importance_score() -> int:
+    """
+    白天严格筛选。
+    如果到晚上还没到 4 条，稍微放宽，但不会低于 MIN_RELAXED_IMPORTANCE_SCORE。
+    """
+    sent_today = sent_news_count_today()
+    hour = datetime.now().hour
+
+    if sent_today >= MIN_NEWS_PER_DAY:
+        return MIN_IMPORTANCE_SCORE
+
+    if hour >= 22:
+        return max(MIN_IMPORTANCE_SCORE - 2, MIN_RELAXED_IMPORTANCE_SCORE)
+
+    if hour >= 18:
+        return max(MIN_IMPORTANCE_SCORE - 1, MIN_RELAXED_IMPORTANCE_SCORE)
+
+    return MIN_IMPORTANCE_SCORE
 
 
 # =========================
@@ -426,6 +653,13 @@ def build_final_text(result: dict) -> str:
 # Telegram 发送
 # =========================
 
+def safe_caption(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= 1024:
+        return text
+    return text[:1000].rstrip() + "\n……"
+
+
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(
@@ -448,7 +682,7 @@ def send_telegram_photo_by_file(photo_path: str, caption: str):
             url,
             data={
                 "chat_id": CHAT_ID,
-                "caption": caption
+                "caption": safe_caption(caption)
             },
             files={"photo": f},
             timeout=30
@@ -458,21 +692,31 @@ def send_telegram_photo_by_file(photo_path: str, caption: str):
 
 
 # =========================
-# 主流程
+# 候选新闻收集
 # =========================
 
-def process_feed(feed_url: str):
+def collect_candidates_from_feed(feed_url: str, seen_fingerprints: set) -> list:
     print(f"[{datetime.now()}] 检查 RSS: {feed_url}")
+
     feed = feedparser.parse(feed_url)
 
     if not feed.entries:
         print("没有抓到内容")
-        return
+        return []
 
     entries = list(feed.entries[:MAX_FEED_ITEMS_PER_CHECK])
     entries.reverse()
 
     first_run = not has_any_sent_data()
+    min_score = current_min_importance_score()
+
+    candidates = []
+
+    print(
+        f"今日已发 {sent_news_count_today()} 条，"
+        f"当前最低分 {min_score}，"
+        f"本源候选 {len(entries)} 条"
+    )
 
     for entry in entries:
         link = getattr(entry, "link", "").strip()
@@ -482,8 +726,14 @@ def process_feed(feed_url: str):
         if not link or not title_en:
             continue
 
+        if fingerprint and fingerprint in seen_fingerprints:
+            print("本轮重复标题，跳过:", title_en)
+            continue
+
         if should_skip_title(title_en):
             print("跳过低价值标题:", title_en)
+            mark_sent(link, fingerprint)
+            log_news(link, title_en, "skipped", 0, "low_value_title")
             continue
 
         if has_sent_link(link) or (fingerprint and has_sent_fingerprint(fingerprint)):
@@ -493,39 +743,157 @@ def process_feed(feed_url: str):
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link, fingerprint)
+            log_news(link, title_en, "skipped", 0, "first_run_skip_old")
             continue
 
         summary_en = extract_summary(entry)
+        summary_en = shorten_text(summary_en, MAX_SUMMARY_LENGTH)
+
+        score = importance_score(title_en, summary_en)
+
+        # 极低分新闻，永久跳过，避免以后反复处理
+        if score < MIN_RELAXED_IMPORTANCE_SCORE:
+            print(
+                f"重要性太低，永久跳过，不调用AI: "
+                f"score={score}, min_relaxed={MIN_RELAXED_IMPORTANCE_SCORE}, title={title_en}"
+            )
+            mark_sent(link, fingerprint)
+            log_news(link, title_en, "skipped", score, "very_low_importance")
+            continue
+
+        # 中等新闻，白天先不发，晚上如果还没够数量，可能放宽后再发
+        if score < min_score:
+            print(
+                f"重要性不足，暂缓，不调用AI: "
+                f"score={score}, min={min_score}, title={title_en}"
+            )
+            log_news(link, title_en, "held", score, "below_current_threshold")
+            continue
+
+        candidates.append({
+            "feed_url": feed_url,
+            "link": link,
+            "title_en": title_en,
+            "summary_en": summary_en,
+            "fingerprint": fingerprint,
+            "score": score,
+        })
+
+        if fingerprint:
+            seen_fingerprints.add(fingerprint)
+
+    return candidates
+
+
+def collect_all_candidates() -> list:
+    all_candidates = []
+    seen_fingerprints = set()
+
+    for rss in RSS_URLS:
+        try:
+            candidates = collect_candidates_from_feed(rss, seen_fingerprints)
+            all_candidates.extend(candidates)
+        except Exception as e:
+            print(f"处理 RSS 失败 {rss}: {e}")
+
+    # 分数高的优先；同分时保持 RSS 抓取顺序
+    all_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    if all_candidates:
+        print("本轮高分候选：")
+        for c in all_candidates[:5]:
+            print(f"score={c['score']} | {c['title_en']}")
+    else:
+        print("本轮没有达到发送门槛的候选新闻")
+
+    return all_candidates
+
+
+# =========================
+# 发送候选新闻
+# =========================
+
+def process_candidate(candidate: dict):
+    link = candidate["link"]
+    title_en = candidate["title_en"]
+    summary_en = candidate["summary_en"]
+    fingerprint = candidate["fingerprint"]
+    score = candidate["score"]
+
+    print(f"进入AI处理: score={score}, title={title_en}")
+
+    result = ai_compile_news(title_en, summary_en)
+    if not result:
+        print("AI 结果无效，跳过:", title_en)
+        mark_sent(link, fingerprint)
+        log_news(link, title_en, "skipped", score, "invalid_ai_result")
+        return False
+
+    final_text = build_final_text(result)
+    photo_path = get_best_local_image(result)
+
+    if photo_path and os.path.isfile(photo_path):
+        resp = send_telegram_photo_by_file(photo_path, final_text)
+        if resp.status_code != 200:
+            print("图片发送失败，改为纯文字")
+            resp = send_telegram_message(final_text)
+    else:
+        resp = send_telegram_message(final_text)
+
+    if resp.status_code == 200:
+        mark_sent(link, fingerprint)
+        log_news(link, title_en, "sent", score, "sent_ok")
+        print(f"已发送: score={score}, title={title_en}")
+        return True
+
+    print("发送失败，未记录为已发送:", title_en)
+    log_news(link, title_en, "failed", score, f"telegram_status_{resp.status_code}")
+    return False
+
+
+def process_one_check() -> int:
+    if sent_news_count_today() >= MAX_NEWS_PER_DAY:
+        print(f"今日新闻已达到上限 {MAX_NEWS_PER_DAY} 条，本轮不再处理")
+        return 0
+
+    candidates = collect_all_candidates()
+
+    if not candidates:
+        return 0
+
+    sent_this_check = 0
+
+    for candidate in candidates:
+        if sent_news_count_today() >= MAX_NEWS_PER_DAY:
+            print(f"今日已达到 {MAX_NEWS_PER_DAY} 条上限，停止发送")
+            break
+
+        if sent_this_check >= MAX_NEWS_PER_CHECK:
+            print(f"本轮已达到发送上限 {MAX_NEWS_PER_CHECK} 条")
+            break
 
         try:
-            result = ai_compile_news(title_en, summary_en)
-            if not result:
-                print("AI 结果无效，跳过:", title_en)
-                mark_sent(link, fingerprint)
-                continue
-
-            final_text = build_final_text(result)
-            photo_path = get_best_local_image(result)
-
-            if photo_path and os.path.isfile(photo_path):
-                resp = send_telegram_photo_by_file(photo_path, final_text)
-                if resp.status_code != 200:
-                    print("图片发送失败，改为纯文字")
-                    resp = send_telegram_message(final_text)
-            else:
-                resp = send_telegram_message(final_text)
-
-            if resp.status_code == 200:
-                mark_sent(link, fingerprint)
-                print("已发送:", title_en)
-            else:
-                print("发送失败，未记录:", title_en)
-
+            ok = process_candidate(candidate)
+            if ok:
+                sent_this_check += 1
         except Exception as e:
-            print("处理失败:", title_en, "->", e)
+            print("处理失败:", candidate["title_en"], "->", e)
+            log_news(
+                candidate["link"],
+                candidate["title_en"],
+                "failed",
+                candidate["score"],
+                str(e)[:200]
+            )
 
         time.sleep(SEND_DELAY)
 
+    return sent_this_check
+
+
+# =========================
+# 主流程
+# =========================
 
 def main():
     if not BOT_TOKEN:
@@ -537,17 +905,27 @@ def main():
 
     init_db()
 
-    print("石墨烯财经频道机器人启动成功（标题版）")
+    print("石墨烯财经新闻精选机器人启动成功（正式省 token 版）")
     print("频道:", CHAT_ID)
+    print("检查间隔:", CHECK_INTERVAL)
+    print("每天目标:", f"{MIN_NEWS_PER_DAY}-{MAX_NEWS_PER_DAY} 条")
+    print("每轮最多发送:", MAX_NEWS_PER_CHECK)
+    print("白天最低分:", MIN_IMPORTANCE_SCORE)
+    print("放宽最低分:", MIN_RELAXED_IMPORTANCE_SCORE)
 
     while True:
-        for rss in RSS_URLS:
-            try:
-                process_feed(rss)
-            except Exception as e:
-                print(f"处理 RSS 失败 {rss}: {e}")
+        try:
+            sent_this_check = process_one_check()
+        except Exception as e:
+            print("本轮处理失败:", e)
+            sent_this_check = 0
 
-        print(f"休眠 {CHECK_INTERVAL} 秒...\n")
+        print(
+            f"本轮已发送 {sent_this_check} 条，"
+            f"今日已发送 {sent_news_count_today()} / {MAX_NEWS_PER_DAY} 条，"
+            f"休眠 {CHECK_INTERVAL} 秒...\n"
+        )
+
         time.sleep(CHECK_INTERVAL)
 
 
