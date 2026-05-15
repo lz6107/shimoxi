@@ -20,6 +20,9 @@ RSS_URLS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
+
+    # 空投 / 撸毛
+    "https://airdropalert.com/feed/rssfeed",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -45,12 +48,13 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4-nano")
 FIRST_RUN_SKIP_OLD = True
 IMAGES_DIR = "images"
 
-# 5 张图文件名
+# 6 张图文件名
 BTC_IMAGE = os.getenv("BTC_IMAGE", "btc.png")
 ETH_IMAGE = os.getenv("ETH_IMAGE", "eth.png")
 ALTCOIN_IMAGE = os.getenv("ALTCOIN_IMAGE", "altcoin.png")
 ONCHAIN_IMAGE = os.getenv("ONCHAIN_IMAGE", "onchain.png")
 MACRO_IMAGE = os.getenv("MACRO_IMAGE", "macro.png")
+AIRDROP_IMAGE = os.getenv("AIRDROP_IMAGE", "airdrop.png")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -111,7 +115,23 @@ IMPORTANT_KEYWORDS = [
     ("xrp", 2), ("bnb", 2),
     ("dogecoin", 1), ("doge", 1),
     ("pepe", 1), ("meme", 1),
-    ("ai token", 1), ("airdrop", 1),
+    ("ai token", 1),
+
+    # 空投 / 撸毛 / 交互
+    ("airdrop", 3), ("airdrops", 3),
+    ("free token", 2), ("claim", 2),
+    ("eligible", 2), ("eligibility", 2),
+    ("snapshot", 2),
+    ("points", 2),
+    ("quest", 2), ("quests", 2),
+    ("testnet", 2),
+    ("mainnet", 1),
+    ("galxe", 2), ("layer3", 2), ("zealy", 2),
+    ("faucet", 1),
+    ("reward", 1), ("rewards", 1),
+    ("retroactive", 2),
+    ("incentive", 1),
+    ("campaign", 1),
 ]
 
 LOW_VALUE_KEYWORDS = [
@@ -154,6 +174,7 @@ def importance_score(title_en: str, summary_en: str = "") -> int:
         "binance", "coinbase",
         "hack", "exploit",
         "liquidation", "whale",
+        "airdrop", "claim", "eligible", "snapshot", "testnet",
     ]
 
     for kw in hot_title_words:
@@ -167,6 +188,7 @@ def importance_score(title_en: str, summary_en: str = "") -> int:
         "rejects", "sues", "settlement",
         "breach", "stolen", "ban",
         "launches", "files", "warns",
+        "airdrop", "claim", "snapshot", "eligibility",
     ]
 
     for kw in big_event_words:
@@ -306,7 +328,6 @@ def log_news(link: str, title: str, status: str, score: int = 0, reason: str = "
 def sent_news_count_today() -> int:
     """
     统计今天已发送数量。
-
     兼容旧版本：
     - 新版本发送成功会写 news_log(status='sent')
     - 旧版本没有 news_log，只写 sent_links
@@ -460,7 +481,7 @@ def make_fingerprint(title_en: str) -> str:
 
 
 # =========================
-# 图片处理（5图版）
+# 图片处理（6图版）
 # =========================
 
 def image_path(filename: str) -> str:
@@ -476,6 +497,7 @@ def get_best_local_image(result: dict) -> str:
         "altcoin": ALTCOIN_IMAGE,
         "onchain": ONCHAIN_IMAGE,
         "macro": MACRO_IMAGE,
+        "airdrop": AIRDROP_IMAGE,
     }
 
     filename = mapping.get(image_type, MACRO_IMAGE)
@@ -498,7 +520,7 @@ SYSTEM_PROMPT = """
 你是“石墨烯财经”的中文加密市场编辑，负责把英文加密新闻加工成适合中文频道发布的内容。
 
 覆盖主题：
-比特币、以太坊、山寨币、链上趋势、宏观与加密
+比特币、以太坊、山寨币、链上趋势、宏观与加密、空投、撸毛、测试网交互、积分任务
 
 你的任务不是机械翻译，而是做中文编译和市场提炼。
 
@@ -507,8 +529,8 @@ SYSTEM_PROMPT = """
 2. 不要输出英文
 3. 不要输出原新闻标题、原新闻摘要、来源、链接
 4. title_cn 要写成简洁、有判断、有内容感的中文短标题，不能太长，建议 8 到 16 个字
-5. main_text 要写成适合频道发布的正文，2到4句
-6. takeaway 只写1句，作为最后的“一句话”判断
+5. main_text 要写成适合频道发布的正文
+6. takeaway 只写1句，作为最后的“一句话”判断；但如果 image_type 是 airdrop，takeaway 可以留空
 7. 同时判断 image_type、bias
 8. 语言自然、简洁、专业，不要喊单，不要夸张
 9. 不要保留原新闻痕迹，要像重新加工后的中文内容
@@ -516,7 +538,7 @@ SYSTEM_PROMPT = """
 11. 只输出 JSON，不要输出 JSON 以外的任何内容
 
 image_type 只能是：
-btc、eth、altcoin、onchain、macro
+btc、eth、altcoin、onchain、macro、airdrop
 
 bias 只能是：
 偏多、偏空、中性、观望
@@ -530,24 +552,47 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 JSON 格式必须严格如下：
 {{
   "title_cn": "简洁中文标题",
-  "image_type": "btc/eth/altcoin/onchain/macro",
+  "image_type": "btc/eth/altcoin/onchain/macro/airdrop",
   "bias": "偏多/偏空/中性/观望",
-  "main_text": "2到4句加工后的中文正文",
-  "takeaway": "1句简短核心判断"
+  "main_text": "加工后的中文正文",
+  "takeaway": "1句简短核心判断；如果是空投类可以留空"
 }}
 
 字段要求：
 1. title_cn：简洁自然，有内容感，不要太长，建议 8 到 16 个字，不要写成营销标题党
-2. image_type 只能是：btc、eth、altcoin、onchain、macro
+2. image_type 只能是：btc、eth、altcoin、onchain、macro、airdrop
 3. bias 只能是：偏多、偏空、中性、观望
-4. main_text：写成自然中文资讯风格，2到4句，不要翻译腔，不要来源痕迹
-5. takeaway：只写一句话，适合作为“ 一句话：xxx ”
+4. main_text：
+   - 如果不是 airdrop：写成自然中文资讯风格，2到4句，不要翻译腔，不要来源痕迹
+   - 如果是 airdrop：必须写成下面这种结构，并且不要输出任何链接：
+
+在哪撸：
+写清楚可以在哪个平台或入口找任务，例如 Galxe、Layer3、Zealy、项目官网任务页、官方 Discord、官方 X 置顶、测试网任务页等。
+
+要求：
+提炼参与条件，例如需要钱包、测试网交互、社媒绑定、Discord、X、任务验证、积分系统、快照要求等。
+
+能撸到什么：
+提炼可能奖励，例如积分、徽章、白名单、NFT、测试网奖励、未来代币空投预期等。
+不能承诺一定有空投，不能写稳赚、必拿、确定发币。
+
+如果原文信息不足，就写：
+“具体规则以官方任务页为准”。
+
+5. takeaway：
+   - 非 airdrop：只写一句话，适合作为“ 一句话：xxx ”
+   - airdrop：可以留空字符串 ""
 6. 不要输出英文
 7. 不要输出来源
 8. 不要输出链接
 9. 不要输出多余字段
 10. 不要使用省略号
 11. 句子必须完整
+12. 如果是 airdrop，title_cn 不要写“暴富机会”“重大利好”，要写成信息型标题，例如：
+    “某项目空投任务更新”
+    “某测试网开放交互”
+    “某项目积分任务上线”
+    “某空投资格查询开启”
 
 image_type 参考规则：
 - btc：比特币、BTC、比特币ETF、矿工、比特币主导行情
@@ -555,6 +600,7 @@ image_type 参考规则：
 - altcoin：SOL、XRP、DOGE、BNB、MEME、公链、山寨币轮动
 - onchain：链上数据、地址、资金流向、巨鲸、质押、解锁、链上趋势
 - macro：监管、政策、SEC、ETF审批、宏观、利率、全球市场、综合快讯
+- airdrop：空投、撸毛、测试网、积分任务、交互任务、Galxe、Layer3、Zealy、claim、eligible、snapshot、points、quest、reward
 
 英文标题：
 {title_en}
@@ -596,14 +642,17 @@ def ai_compile_news(title_en: str, summary_en: str) -> dict:
     main_text = clean_paragraph(str(data.get("main_text", "")))
     takeaway = clean_one_line(str(data.get("takeaway", "")))
 
-    valid_types = {"btc", "eth", "altcoin", "onchain", "macro"}
+    valid_types = {"btc", "eth", "altcoin", "onchain", "macro", "airdrop"}
     valid_bias = {"偏多", "偏空", "中性", "观望"}
 
     if image_type not in valid_types:
         return {}
     if bias not in valid_bias:
         return {}
-    if not title_cn or not main_text or not takeaway:
+    if not title_cn or not main_text:
+        return {}
+
+    if image_type != "airdrop" and not takeaway:
         return {}
 
     return {
@@ -625,6 +674,7 @@ PRIMARY_TAG_MAP = {
     "altcoin": "#山寨币",
     "onchain": "#链上",
     "macro": "#宏观",
+    "airdrop": "#空投",
 }
 
 SECONDARY_TAG_MAP = {
@@ -633,6 +683,7 @@ SECONDARY_TAG_MAP = {
     "altcoin": "#加密市场",
     "onchain": "#链上观察",
     "macro": "#政策解读",
+    "airdrop": "#撸毛机会",
 }
 
 
@@ -640,6 +691,14 @@ def build_final_text(result: dict) -> str:
     primary_tag = PRIMARY_TAG_MAP[result["image_type"]]
     secondary_tag = SECONDARY_TAG_MAP[result["image_type"]]
     bias_tag = "#" + result["bias"]
+
+    # 空投 / 撸毛资讯不显示“一句话：xxx”
+    if result["image_type"] == "airdrop":
+        return f"""石墨烯财经｜{result["title_cn"]}
+
+{result["main_text"]}
+
+{primary_tag} {secondary_tag} {bias_tag}""".strip()
 
     return f"""石墨烯财经｜{result["title_cn"]}
 
@@ -905,7 +964,7 @@ def main():
 
     init_db()
 
-    print("石墨烯财经新闻精选机器人启动成功（正式省 token 版）")
+    print("石墨烯财经新闻精选机器人启动成功（正式省 token + 空投版）")
     print("频道:", CHAT_ID)
     print("检查间隔:", CHECK_INTERVAL)
     print("每天目标:", f"{MIN_NEWS_PER_DAY}-{MAX_NEWS_PER_DAY} 条")
