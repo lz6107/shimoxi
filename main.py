@@ -3,6 +3,9 @@ import re
 import json
 import time
 import html
+import random
+import threading
+import asyncio
 import sqlite3
 import hashlib
 from datetime import datetime
@@ -10,6 +13,8 @@ from datetime import datetime
 import feedparser
 import requests
 from openai import OpenAI
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 
 # =========================
@@ -55,6 +60,26 @@ ALTCOIN_IMAGE = os.getenv("ALTCOIN_IMAGE", "altcoin.png")
 ONCHAIN_IMAGE = os.getenv("ONCHAIN_IMAGE", "onchain.png")
 MACRO_IMAGE = os.getenv("MACRO_IMAGE", "macro.png")
 AIRDROP_IMAGE = os.getenv("AIRDROP_IMAGE", "airdrop.png")
+
+# =========================
+# 币圈风险快讯配置
+# =========================
+
+ENABLE_RISK_COLUMN = os.getenv("ENABLE_RISK_COLUMN", "true").lower() == "true"
+RISK_IMAGE = os.getenv("RISK_IMAGE", "risk.png")
+RISK_POST_TIMES = [
+    x.strip()
+    for x in os.getenv("RISK_POST_TIMES", "10:30,15:30,21:30").split(",")
+    if x.strip()
+]
+RISK_MANUAL_BUTTON = os.getenv("RISK_MANUAL_BUTTON", "true").lower() == "true"
+
+# 管理员 Telegram 数字 ID，多个用英文逗号隔开。为空时不限制，正式频道建议填写。
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -229,6 +254,17 @@ def init_db():
             status TEXT,
             score INTEGER,
             reason TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS risk_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            risk_key TEXT UNIQUE,
+            title TEXT,
+            content TEXT,
+            mode TEXT,
             created_at TEXT
         )
     """)
@@ -950,9 +986,409 @@ def process_one_check() -> int:
     return sent_this_check
 
 
+
+# =========================
+# 币圈风险快讯栏目
+# =========================
+
+RISK_TOPIC_POOL = [
+    {
+        "topic": "USDT项目避坑",
+        "angle": "USDT、赚钱项目、稳定收益、代收代付、项目曝光",
+        "keywords": ["USDT", "赚钱项目", "项目避坑", "风险曝光", "资金安全"],
+    },
+    {
+        "topic": "兼职骗局",
+        "angle": "兼职、USDT结算、海外项目、账户风控、代收款风险",
+        "keywords": ["兼职", "USDT", "兼职骗局", "资金安全", "风险曝光"],
+    },
+    {
+        "topic": "东南亚项目风险",
+        "angle": "东南亚、虚拟币项目、USDT流转、高收益话术、资金盘包装",
+        "keywords": ["东南亚", "USDT", "项目风险", "资金盘", "风险曝光"],
+    },
+    {
+        "topic": "柬埔寨风险观察",
+        "angle": "柬埔寨、兼职招聘、USDT收款、项目盘、账户冻结风险",
+        "keywords": ["柬埔寨", "兼职", "USDT", "资金安全", "项目避坑"],
+    },
+    {
+        "topic": "赚钱项目风险",
+        "angle": "赚钱、返佣、拉人、充值门槛、稳定回报、币圈项目包装",
+        "keywords": ["赚钱", "项目", "资金盘", "项目避坑", "风险曝光"],
+    },
+    {
+        "topic": "场外交易风险",
+        "angle": "USDT场外交易、冻卡风险、代收代付、资金来源、交易所风控",
+        "keywords": ["USDT", "场外交易", "冻卡风险", "资金安全", "风险曝光"],
+    },
+]
+
+RISK_TITLE_PREFIXES = [
+    "币圈风险快讯",
+    "USDT风险观察",
+    "项目避坑",
+    "资金安全监控",
+    "币圈曝光台",
+]
+
+RISK_FALLBACK_TEMPLATES = [
+    """【{prefix}｜{topic}】
+
+消息面：
+USDT、赚钱项目、兼职、项目曝光这类词近期经常和币圈资金安全绑定，尤其是“稳定收益”“海外项目”“代收代付”“低门槛赚钱”这类话术，容易被包装成看似正常的虚拟币机会。
+
+风险观察：
+这类项目通常会先用收益预期吸引用户，再引导注册钱包、绑定交易所账号、充值USDT或参与所谓资金流转。看起来像普通兼职或投资项目，真正的风险往往集中在资金来源不明、账户冻结、身份信息被滥用和提现受限。
+
+观察重点：
+凡是要求先充值、刷流水、代收USDT、拉人返佣、承诺稳定回报的项目，都应该优先按高风险处理。币圈赚钱机会很多，但只靠话术推动入金的项目，风险远大于收益。
+
+相关关键词：
+{keyword_line}
+
+{tags}""",
+    """【{prefix}｜{topic}】
+
+快讯观察：
+近期“USDT结算”“兼职赚钱”“东南亚项目”“柬埔寨机会”“项目曝光”等关键词，和资金安全、场外交易、灰色支付风险联系更紧。很多内容表面是币圈项目，实际核心动作却围绕收款、转账、充值和拉人展开。
+
+风险点：
+如果一个项目不强调产品、链上数据和真实业务，只强调赚钱、团队扶持、返佣、代收款或快速回本，就要把它当成风险信号。尤其是要求使用USDT完成资金流转的兼职，更容易触发交易所风控、冻卡或账户审查。
+
+避坑方向：
+先看项目是否有公开合约、真实产品、清晰规则和可验证团队；再看是否要求先垫付、先充值、拉人头或代收代付。只要绕不开这些动作，就不适合当普通赚钱项目看待。
+
+相关关键词：
+{keyword_line}
+
+{tags}""",
+    """【{prefix}｜{topic}】
+
+市场提醒：
+币圈风险内容里，USDT、兼职、赚钱项目、东南亚、柬埔寨、曝光这些词经常出现在同一类叙事里：先给用户一个低门槛入口，再把风险藏在钱包、交易所账号和资金流转环节。
+
+风险观察：
+真正需要警惕的不是“能不能赚钱”本身，而是项目是否让用户承担了看不见的资金风险。比如要求接收USDT、帮忙转账、参与所谓跑分、用个人账户做资金流转，这些都可能把普通用户卷进高风险链条。
+
+观察重点：
+遇到“日结兼职、USDT结算、海外项目、稳定收益、导师带队、先充值后返利”这类组合词，优先按项目避坑处理，不要只看收益描述。
+
+相关关键词：
+{keyword_line}
+
+{tags}""",
+]
+
+
+def is_admin_id(user_id: int) -> bool:
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+def today_key() -> str:
+    return datetime.now().strftime("%Y%m%d")
+
+
+def minute_now() -> str:
+    return datetime.now().strftime("%H:%M")
+
+
+def risk_key_for_slot(slot_index: int) -> str:
+    return f"{today_key()}:risk:{slot_index}"
+
+
+def risk_key_sent(risk_key: str) -> bool:
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM risk_log WHERE risk_key = ?", (risk_key,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def record_risk_sent(risk_key: str, title: str, content: str, mode: str):
+    conn = sqlite3.connect("data.db")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO risk_log(risk_key, title, content, mode, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (risk_key, title, content, mode, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def pick_risk_tags(keywords):
+    base = ["#USDT", "#风险曝光", "#项目避坑", "#资金安全", "#兼职骗局", "#东南亚", "#柬埔寨", "#赚钱项目"]
+    mapping = {
+        "USDT": "#USDT",
+        "赚钱": "#赚钱项目",
+        "赚钱项目": "#赚钱项目",
+        "项目": "#项目避坑",
+        "项目避坑": "#项目避坑",
+        "项目风险": "#项目避坑",
+        "东南亚": "#东南亚",
+        "柬埔寨": "#柬埔寨",
+        "曝光": "#风险曝光",
+        "风险曝光": "#风险曝光",
+        "兼职": "#兼职骗局",
+        "兼职骗局": "#兼职骗局",
+        "资金安全": "#资金安全",
+        "资金盘": "#资金盘",
+        "场外交易": "#场外交易",
+        "冻卡风险": "#冻卡风险",
+    }
+    candidates = []
+    for k in keywords:
+        tag = mapping.get(k)
+        if tag and tag not in candidates:
+            candidates.append(tag)
+    for tag in base:
+        if tag not in candidates:
+            candidates.append(tag)
+    random.shuffle(candidates)
+    # 每条 4-5 个标签，最多 5 个
+    n = random.randint(4, 5)
+    return " ".join(candidates[:n])
+
+
+def clean_risk_text(text: str) -> str:
+    text = (text or "").strip()
+    text = text.replace("...", "").replace("……", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def risk_ai_prompt(topic: dict, prefix: str, tags: str) -> str:
+    return f"""
+请生成一条 Telegram 频道“币圈风险快讯”。
+
+核心要求：
+1. 写得像币圈新闻快讯，但不要编造具体真实人名、项目名、公司名、金额、案发时间。
+2. 不要写“某某真实被骗”“某项目真实跑路”这种无法验证的事实。
+3. 可以使用“消息面、风险观察、观察重点、相关关键词”这种新闻化结构。
+4. 内容要稍微长一点，比普通短评更充实，适合频道留人。
+5. 必须自然带入这些关键词里的大部分：USDT、赚钱、项目、东南亚、柬埔寨、曝光、兼职。
+6. 语气要像币圈资金安全快讯，不要像法律科普，不要像广告。
+7. 不要输出链接。
+8. 不要喊单，不要承诺收益。
+9. 末尾必须保留我给你的标签行。
+
+标题固定为：
+【{prefix}｜{topic['topic']}】
+
+本条角度：
+{topic['angle']}
+
+建议相关关键词：
+{', '.join(topic['keywords'])}
+
+标签行：
+{tags}
+
+请直接输出完整频道文案，格式如下：
+
+【{prefix}｜{topic['topic']}】
+
+消息面：
+...
+
+风险观察：
+...
+
+观察重点：
+...
+
+相关关键词：
+...
+
+{tags}
+""".strip()
+
+
+def ai_generate_risk_content(topic: dict, prefix: str, tags: str) -> str:
+    if not OPENAI_API_KEY or not client:
+        return ""
+
+    try:
+        response = client.responses.create(
+            model=MODEL_NAME,
+            input=risk_ai_prompt(topic, prefix, tags),
+        )
+        text = clean_risk_text(response.output_text or "")
+        if text and len(text) >= 180:
+            return text
+    except Exception as e:
+        print("风险快讯 AI 生成失败，使用模板:", e)
+
+    return ""
+
+
+def fallback_risk_content(topic: dict, prefix: str, tags: str) -> str:
+    keyword_line = "、".join(topic["keywords"])
+    template = random.choice(RISK_FALLBACK_TEMPLATES)
+    return template.format(
+        prefix=prefix,
+        topic=topic["topic"],
+        keyword_line=keyword_line,
+        tags=tags,
+    ).strip()
+
+
+def build_risk_content() -> tuple[str, str]:
+    topic = random.choice(RISK_TOPIC_POOL)
+    prefix = random.choice(RISK_TITLE_PREFIXES)
+    tags = pick_risk_tags(topic["keywords"])
+
+    text = ai_generate_risk_content(topic, prefix, tags)
+    if not text:
+        text = fallback_risk_content(topic, prefix, tags)
+
+    title = f"{prefix}｜{topic['topic']}"
+    return title, text
+
+
+def get_risk_image_path() -> str:
+    path = image_path(RISK_IMAGE)
+    if os.path.isfile(path):
+        return path
+
+    fallback = image_path(MACRO_IMAGE)
+    if os.path.isfile(fallback):
+        return fallback
+
+    return ""
+
+
+def send_risk_news(manual: bool = False) -> bool:
+    title, text = build_risk_content()
+    photo_path = get_risk_image_path()
+
+    if photo_path and os.path.isfile(photo_path):
+        resp = send_telegram_photo_by_file(photo_path, text)
+        if resp.status_code != 200:
+            print("风险快讯图片发送失败，改为纯文字")
+            resp = send_telegram_message(text)
+    else:
+        resp = send_telegram_message(text)
+
+    if resp.status_code == 200:
+        key = f"{today_key()}:risk:manual:{int(time.time())}" if manual else f"{today_key()}:risk:auto:{int(time.time())}"
+        record_risk_sent(key, title, text, "manual" if manual else "auto")
+        print("风险快讯已发送:", title)
+        return True
+
+    print("风险快讯发送失败:", resp.status_code, resp.text)
+    return False
+
+
+def process_risk_column() -> int:
+    if not ENABLE_RISK_COLUMN:
+        return 0
+
+    now_hhmm = minute_now()
+    sent = 0
+
+    for idx, hhmm in enumerate(RISK_POST_TIMES):
+        key = risk_key_for_slot(idx)
+        if risk_key_sent(key):
+            continue
+
+        # 到点后发送。由于主循环是 30 分钟检查一次，允许在该时间之后补发一次。
+        if now_hhmm >= hhmm:
+            ok = send_risk_news(manual=False)
+            if ok:
+                # 把固定时段 key 也记录掉，避免当天重复补发
+                record_risk_sent(key, f"slot-{idx}", "AUTO_SLOT_SENT", "auto_slot")
+                sent += 1
+            break
+
+    return sent
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_id(user.id):
+        await update.message.reply_text("你没有权限操作这个机器人。")
+        return
+
+    keyboard = []
+    if RISK_MANUAL_BUTTON:
+        keyboard.append([
+            InlineKeyboardButton("立即发送币圈风险快讯", callback_data="send_risk_now")
+        ])
+
+    text = (
+        "石墨烯财经机器人运行中。\n\n"
+        "可用操作：\n"
+        "1. 点击按钮：立即发送一条币圈风险快讯\n"
+        "2. 命令：/risk_now 立即发送一条风险快讯\n\n"
+        "手动发送会突破每日次数和时间限制，一次只发送一条。"
+    )
+
+    if keyboard:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text)
+
+
+async def risk_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_id(user.id):
+        await update.message.reply_text("你没有权限操作这个机器人。")
+        return
+
+    await update.message.reply_text("正在发送一条币圈风险快讯……")
+    ok = await asyncio.to_thread(send_risk_news, True)
+    await update.message.reply_text("已发送。" if ok else "发送失败，请查看 Railway 日志。")
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if not user or not is_admin_id(user.id):
+        await query.answer("你没有权限。", show_alert=True)
+        return
+
+    if query.data == "send_risk_now":
+        await query.answer("正在发送……")
+        ok = await asyncio.to_thread(send_risk_news, True)
+        await query.edit_message_text("币圈风险快讯已发送。" if ok else "发送失败，请查看 Railway 日志。")
+
+
 # =========================
 # 主流程
 # =========================
+
+def worker_loop():
+    print("新闻精选后台循环已启动")
+    while True:
+        try:
+            sent_this_check = process_one_check()
+        except Exception as e:
+            print("本轮新闻处理失败:", e)
+            sent_this_check = 0
+
+        try:
+            risk_sent = process_risk_column()
+        except Exception as e:
+            print("风险快讯处理失败:", e)
+            risk_sent = 0
+
+        print(
+            f"本轮新闻已发送 {sent_this_check} 条，"
+            f"风险快讯已发送 {risk_sent} 条，"
+            f"今日新闻已发送 {sent_news_count_today()} / {MAX_NEWS_PER_DAY} 条，"
+            f"休眠 {CHECK_INTERVAL} 秒...\n"
+        )
+
+        time.sleep(CHECK_INTERVAL)
+
 
 def main():
     if not BOT_TOKEN:
@@ -964,28 +1400,28 @@ def main():
 
     init_db()
 
-    print("石墨烯财经新闻精选机器人启动成功（正式省 token + 空投版）")
+    print("石墨烯财经新闻精选机器人启动成功（风险快讯按钮版）")
     print("频道:", CHAT_ID)
     print("检查间隔:", CHECK_INTERVAL)
     print("每天目标:", f"{MIN_NEWS_PER_DAY}-{MAX_NEWS_PER_DAY} 条")
     print("每轮最多发送:", MAX_NEWS_PER_CHECK)
     print("白天最低分:", MIN_IMPORTANCE_SCORE)
     print("放宽最低分:", MIN_RELAXED_IMPORTANCE_SCORE)
+    print("风险快讯:", "开启" if ENABLE_RISK_COLUMN else "关闭")
+    print("风险快讯时间:", ", ".join(RISK_POST_TIMES))
+    print("风险快讯图片:", RISK_IMAGE)
+    print("管理员限制:", "已开启" if ADMIN_IDS else "未设置 ADMIN_IDS，任何人私聊机器人都可操作")
 
-    while True:
-        try:
-            sent_this_check = process_one_check()
-        except Exception as e:
-            print("本轮处理失败:", e)
-            sent_this_check = 0
+    t = threading.Thread(target=worker_loop, daemon=True)
+    t.start()
 
-        print(
-            f"本轮已发送 {sent_this_check} 条，"
-            f"今日已发送 {sent_news_count_today()} / {MAX_NEWS_PER_DAY} 条，"
-            f"休眠 {CHECK_INTERVAL} 秒...\n"
-        )
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("risk_now", risk_now_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-        time.sleep(CHECK_INTERVAL)
+    print("按钮机器人已启动：/start 可打开手动发送按钮")
+    app.run_polling()
 
 
 if __name__ == "__main__":
